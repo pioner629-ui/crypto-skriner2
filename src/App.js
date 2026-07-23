@@ -2,23 +2,18 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { createChart, ColorType, CrosshairMode, LineStyle, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
 import {
   RefreshCw, Search, Copy, Check, TrendingUp, ChevronLeft, ChevronRight,
-  Clock, ChevronUp, ChevronDown, Grid3x3, Grid2x2, BarChart3, X
+  Clock, ChevronUp, ChevronDown, Grid3x3, Grid2x2, BarChart3
 } from 'lucide-react';
 
-const MAX_CANDLE_COUNT = 300;
-const DEFAULT_CANDLE_COUNT = 60;
+const MAX_CANDLE_COUNT = 500;
+const DEFAULT_CANDLE_COUNT = 100;
 const CHART_HEIGHT = 240;
-const EXPANDED_CHART_HEIGHT = 600;
-const MIN_FETCH_INTERVAL = 5000;
-const CONCURRENCY_LIMIT = 5;
-const SPOT_ORDER_MIN_USD    = 100_000;
-const FUTURES_ORDER_MIN_USD = 200_000;
-const ORDER_DEPTH_LEVELS    = 100;
-const ORDER_DISTANCE_PCT    = 5;
+const MIN_FETCH_INTERVAL = 2000;
+const CONCURRENCY_LIMIT = 15;
 
 // ── Батчинг тикерного WS ──────────────────────
-const TICKER_BATCH_MS  = 500;
-const KLINE_BATCH_MS   = 500;
+const TICKER_BATCH_MS  = 300;
+const KLINE_BATCH_MS   = 400;
 
 // ── Цветовые градации ──────────────────────────
 function volColor(v) {
@@ -59,12 +54,9 @@ const storage = {
 async function pMap(items, fn, concurrency = CONCURRENCY_LIMIT) {
   const results = [];
   let index = 0;
-  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-  
   async function worker() {
     while (index < items.length) {
       const i = index++;
-      await delay(200);
       results[i] = await fn(items[i], i);
     }
   }
@@ -73,7 +65,7 @@ async function pMap(items, fn, concurrency = CONCURRENCY_LIMIT) {
   return results;
 }
 
-async function fetchWithRetry(url, signal, retries = 2) {
+async function fetchWithRetry(url, signal, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -83,7 +75,7 @@ async function fetchWithRetry(url, signal, retries = 2) {
     } catch (err) {
       if (err.name === 'AbortError') throw err;
       if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, 2000 * 2 ** i));
+      await new Promise(r => setTimeout(r, 1000 * 2 ** i));
     }
   }
 }
@@ -195,7 +187,7 @@ function useKlineWebSockets(candleCount, setData) {
       ws.onclose = () => {
         reconnectTimers.current[symbol] = setTimeout(() => {
           if (klineWs.current[symbol] !== undefined) connectKlineWS(symbol);
-        }, 10000);
+        }, 5000);
       };
       klineWs.current[symbol] = ws;
     } catch (e) {
@@ -241,7 +233,6 @@ function useMarketData(candleCount) {
   const [refreshing, setRefreshing] = useState(false);
   const lastFetchRef = useRef(0);
   const abortRef     = useRef(null);
-  const cacheRef     = useRef(new Map());
 
   const fetchData = useCallback(async (isInitial = false) => {
     const now = Date.now();
@@ -259,101 +250,58 @@ function useMarketData(candleCount) {
       const tickerData = await fetchWithRetry('https://fapi.binance.com/fapi/v1/ticker/24hr', signal);
       const usdtPairs = tickerData
         .filter(t => t.symbol.endsWith('USDT'))
-        .map(t => ({ 
-          ...t, 
-          quoteVolume: parseFloat(t.quoteVolume),
-          priceChangePercent: parseFloat(t.priceChangePercent),
-          lastPrice: parseFloat(t.lastPrice),
-          highPrice: parseFloat(t.highPrice),
-          lowPrice: parseFloat(t.lowPrice)
-        }));
-
-      const topByVolume = usdtPairs
+        .map(t => ({ ...t, quoteVolume: parseFloat(t.quoteVolume) }))
         .sort((a, b) => b.quoteVolume - a.quoteVolume)
-        .slice(0, 100);
+        .slice(0, 200);
 
-      const volatilityData = await pMap(topByVolume, async (coin) => {
+      const results = await pMap(usdtPairs, async (coin) => {
         try {
-          const cacheKey = `vol_${coin.symbol}`;
-          const cached = cacheRef.current.get(cacheKey);
-          const now = Date.now();
-          
-          if (cached && (now - cached.timestamp < 60000)) {
-            return cached.data;
-          }
-
-          const klines = await fetchWithRetry(
-            `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=5m&limit=20`,
-            signal
-          );
-
-          if (!klines?.length) return null;
-          const valid = klines.filter(validateKline);
-          if (!valid.length || valid.length < 14) return null;
-
-          const price = coin.lastPrice;
-          const atr = calculateATR(valid, 14);
-          const ntr = (atr / price) * 100;
-
-          const result = {
-            symbol: coin.symbol,
-            ntr: ntr,
-            quoteVolume: coin.quoteVolume / 1e6,
-            price: price,
-            change24h: coin.priceChangePercent,
-            highPrice: coin.highPrice,
-            lowPrice: coin.lowPrice
-          };
-
-          cacheRef.current.set(cacheKey, { data: result, timestamp: Date.now() });
-          return result;
-        } catch (err) {
-          if (err.name === 'AbortError') throw err;
-          return null;
-        }
-      }, CONCURRENCY_LIMIT);
-
-      const sortedByVolatility = volatilityData
-        .filter(Boolean)
-        .sort((a, b) => b.ntr - a.ntr)
-        .slice(0, 50);
-
-      const results = await pMap(sortedByVolatility, async (volData) => {
-        try {
-          const cacheKey = `${volData.symbol}_${candleCount}`;
-          const cached = cacheRef.current.get(cacheKey);
-          const now = Date.now();
-          
-          if (cached && (now - cached.timestamp < 30000)) {
-            return cached.data;
-          }
-
-          const klines = await fetchWithRetry(
-            `https://fapi.binance.com/fapi/v1/klines?symbol=${volData.symbol}&interval=5m&limit=${Math.min(candleCount, 100)}`,
-            signal
-          );
+          const [klines, klines1h, klines4h, klinesDay] = await Promise.all([
+            fetchWithRetry(
+              `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=5m&limit=${candleCount}`,
+              signal
+            ),
+            fetchWithRetry(
+              `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=1h&limit=1`,
+              signal
+            ),
+            fetchWithRetry(
+              `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=4h&limit=1`,
+              signal
+            ),
+            fetchWithRetry(
+              `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=1d&limit=1`,
+              signal
+            ),
+          ]);
 
           if (!klines?.length) return null;
           const valid = klines.filter(validateKline);
           if (!valid.length) return null;
 
-          const price = volData.price;
-          const h1h = Math.max(...valid.slice(-12).map(k => parseFloat(k[2])));
-          const h1l = Math.min(...valid.slice(-12).map(k => parseFloat(k[3])));
-          const h4h = Math.max(...valid.slice(-48).map(k => parseFloat(k[2])));
-          const h4l = Math.min(...valid.slice(-48).map(k => parseFloat(k[3])));
-          const h24 = volData.highPrice;
-          const l24 = volData.lowPrice;
+          const price = parseFloat(coin.lastPrice);
 
-          const change1h = calculateChange1h(valid);
+          const cur1h = klines1h?.[0];
+          const h1h   = cur1h ? parseFloat(cur1h[2]) : Math.max(...valid.slice(-12).map(k => parseFloat(k[2])));
+          const h1l   = cur1h ? parseFloat(cur1h[3]) : Math.min(...valid.slice(-12).map(k => parseFloat(k[3])));
 
-          const result = {
-            symbol:       volData.symbol,
+          const cur4h = klines4h?.[0];
+          const h4h   = cur4h ? parseFloat(cur4h[2]) : Math.max(...valid.slice(-48).map(k => parseFloat(k[2])));
+          const h4l   = cur4h ? parseFloat(cur4h[3]) : Math.min(...valid.slice(-48).map(k => parseFloat(k[3])));
+
+          const curDay = klinesDay?.[0];
+          const h24    = curDay ? parseFloat(curDay[2]) : parseFloat(coin.highPrice);
+          const l24    = curDay ? parseFloat(curDay[3]) : parseFloat(coin.lowPrice);
+
+          const atr = calculateATR(valid, 14);
+
+          return {
+            symbol:       coin.symbol,
             lastPrice:    price,
-            quoteVolume:  volData.quoteVolume,
-            ntr:          volData.ntr,
-            change24h:    volData.change24h,
-            change1h:     change1h,
+            quoteVolume:  coin.quoteVolume / 1e6,
+            ntr:          (atr / price) * 100,
+            change24h:    parseFloat(coin.priceChangePercent),
+            change1h:     calculateChange1h(valid),
             change30m:    calculateChange30m(valid),
             klines:       valid,
             trades15min:  calculateTrades15min(valid),
@@ -365,9 +313,6 @@ function useMarketData(candleCount) {
             dist_d24h: Math.abs(h24  - price) / price,
             dist_d24l: Math.abs(l24  - price) / price,
           };
-
-          cacheRef.current.set(cacheKey, { data: result, timestamp: Date.now() });
-          return result;
         } catch (err) {
           if (err.name === 'AbortError') throw err;
           return null;
@@ -375,57 +320,7 @@ function useMarketData(candleCount) {
       }, CONCURRENCY_LIMIT);
 
       if (signal.aborted) return;
-      
-      let btcData = null;
-      try {
-        const btcTicker = usdtPairs.find(t => t.symbol === 'BTCUSDT');
-        if (btcTicker) {
-          const btcKlines = await fetchWithRetry(
-            `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=${Math.min(candleCount, 100)}`,
-            signal
-          );
-          
-          if (btcKlines?.length) {
-            const valid = btcKlines.filter(validateKline);
-            if (valid.length) {
-              const price = btcTicker.lastPrice;
-              const h1h = Math.max(...valid.slice(-12).map(k => parseFloat(k[2])));
-              const h1l = Math.min(...valid.slice(-12).map(k => parseFloat(k[3])));
-              const h4h = Math.max(...valid.slice(-48).map(k => parseFloat(k[2])));
-              const h4l = Math.min(...valid.slice(-48).map(k => parseFloat(k[3])));
-              const h24 = btcTicker.highPrice;
-              const l24 = btcTicker.lowPrice;
-              const atr = calculateATR(valid, 14);
-              const ntr = (atr / price) * 100;
-              const change1h = calculateChange1h(valid);
-
-              btcData = {
-                symbol: 'BTCUSDT',
-                lastPrice: price,
-                quoteVolume: btcTicker.quoteVolume / 1e6,
-                ntr: ntr,
-                change24h: btcTicker.priceChangePercent,
-                change1h: change1h,
-                change30m: calculateChange30m(valid),
-                klines: valid,
-                trades15min: calculateTrades15min(valid),
-                levels: { h1: { h: h1h, l: h1l }, h4: { h: h4h, l: h4l }, d24: { h: h24, l: l24 } },
-                dist_h1h: Math.abs(h1h - price) / price,
-                dist_h1l: Math.abs(h1l - price) / price,
-                dist_h4h: Math.abs(h4h - price) / price,
-                dist_h4l: Math.abs(h4l - price) / price,
-                dist_d24h: Math.abs(h24 - price) / price,
-                dist_d24l: Math.abs(l24 - price) / price,
-              };
-            }
-          }
-        }
-      } catch (err) {
-        if (err.name !== 'AbortError') console.error('BTC data error:', err);
-      }
-
       const final = results.filter(Boolean);
-      if (btcData) final.push(btcData);
       if (final.length) setData(final);
     } catch (err) {
       if (err.name !== 'AbortError') console.error('fetchData error:', err);
@@ -436,11 +331,10 @@ function useMarketData(candleCount) {
 
   useEffect(() => {
     fetchData(true);
-    const iv = setInterval(() => fetchData(false), 60000);
+    const iv = setInterval(() => fetchData(false), 30000);
     return () => {
       clearInterval(iv);
       abortRef.current?.abort();
-      cacheRef.current.clear();
     };
   }, [fetchData]);
 
@@ -454,7 +348,8 @@ function useTickerWebSocket(setData) {
   const batchRef       = useRef({});
   const batchTimer     = useRef(null);
   const mountedRef     = useRef(true);
-  const setDataRef = useRef(setData);
+  const setDataRef     = useRef(setData);
+  
   useEffect(() => { setDataRef.current = setData; }, [setData]);
 
   const flushBatch = useCallback(() => {
@@ -496,7 +391,7 @@ function useTickerWebSocket(setData) {
         ws.onerror = () => setWsConnected(false);
         ws.onclose = () => {
           setWsConnected(false);
-          reconnectTimer.current = setTimeout(connect, 10000);
+          reconnectTimer.current = setTimeout(connect, 5000);
         };
         ws.onmessage = (event) => {
           try {
@@ -650,285 +545,11 @@ const RulerOverlay = ({ ruler, containerWidth }) => {
   );
 };
 
+// ── Глобальный tick ────────────────────────
 const TickContext = React.createContext(0);
 
-function useLargeOrders(symbols) {
-  const [ordersMap, setOrdersMap] = useState({});
-  const symbolsKey = symbols.join(',');
-
-  useEffect(() => {
-    const emptyOrders = {};
-    symbols.forEach(s => { emptyOrders[s] = []; });
-    setOrdersMap(emptyOrders);
-  }, [symbolsKey]);
-
-  return ordersMap;
-}
-
-function fmtUsd(usd) {
-  if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(1)}M`;
-  return `$${(usd / 1000).toFixed(0)}K`;
-}
-
-const MiniOrderBars = React.memo(({ orders, candleRef, chartHeight, fullscreen, soundEnabled }) => {
-  if (!orders?.length || !candleRef?.current) return null;
-  const maxUsd = orders.reduce((m, o) => Math.max(m, o.usd), 0);
-  if (!maxUsd) return null;
-  const maxH = chartHeight || (fullscreen ? 600 : CHART_HEIGHT);
-
-  return (
-    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 12 }}>
-      {orders.map((o) => {
-        let y = null;
-        try { y = candleRef.current.priceToCoordinate(o.price); } catch {}
-        if (y === null || y < 1 || y > maxH - 1) return null;
-
-        const isBid   = o.side === 'bid';
-        const isSpot  = o.market === 'spot';
-        const color   = isBid ? (isSpot ? '#38bdf8' : '#60a5fa') : (isSpot ? '#f87171' : '#fb923c');
-        const bgBar   = isBid ? (isSpot ? 'rgba(56,189,248,0.45)' : 'rgba(96,165,250,0.45)') : (isSpot ? 'rgba(248,113,113,0.45)' : 'rgba(251,146,60,0.45)');
-        const bgLabel = isBid ? 'rgba(15,40,100,0.88)' : 'rgba(80,15,10,0.88)';
-
-        const maxBarW = fullscreen ? 100 : 50;
-        const barH    = fullscreen ? 10 : 6;
-        const barW    = Math.max(4, Math.round((o.usd / maxUsd) * maxBarW));
-        const fSize   = fullscreen ? 9 : 5;
-        const labelOffset = fullscreen ? 12 : 7;
-
-        return (
-          <div key={`${o.market}-${o.side}-${o.price}`} style={{ position: 'absolute', top: y - 1, left: 0, right: 0 }}>
-            <div style={{ position: 'absolute', right: 0, top: -(barH - 1), height: barH, width: barW, background: bgBar, borderLeft: `2px solid ${color}`, borderRadius: '1px 0 0 1px' }} />
-            <div style={{ position: 'absolute', right: barW + 3, top: -labelOffset, fontSize: fSize, fontFamily: 'Monaco, monospace', color, whiteSpace: 'nowrap', lineHeight: `${fSize + 2}px`, background: bgLabel, padding: '0 3px', borderRadius: 2, border: `1px solid ${color}40` }}>
-              {isSpot ? 'S' : 'F'}{isBid ? '▲' : '▼'} {fmtUsd(o.usd)}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-});
-MiniOrderBars.displayName = 'MiniOrderBars';
-
-const ExpandedChartModal = ({ coin, klines, onClose, candleCount, ordersMap }) => {
-  const modalRef = useRef(null);
-  const containerRef = useRef(null);
-  const chartRef = useRef(null);
-  const candleRef = useRef(null);
-  const volumeRef = useRef(null);
-  const wrapperRef = useRef(null);
-  const linesRef = useRef([]);
-  const ruler = useRuler(wrapperRef, candleRef);
-  const [containerWidth, setContainerWidth] = useState(0);
-  const [ready, setReady] = useState(false);
-
-  const expandedCandleCount = Math.min(candleCount * 2, MAX_CANDLE_COUNT);
-  const [expandedKlines, setExpandedKlines] = useState(klines);
-  const [loading, setLoading] = useState(false);
-  
-  useEffect(() => {
-    const loadMoreKlines = async () => {
-      if (!coin || expandedKlines.length >= expandedCandleCount) return;
-      setLoading(true);
-      try {
-        const response = await fetch(
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${coin.symbol}&interval=5m&limit=${Math.min(expandedCandleCount, 100)}`
-        );
-        const data = await response.json();
-        const validKlines = data.filter(validateKline);
-        if (validKlines.length) {
-          setExpandedKlines(validKlines);
-        }
-      } catch (err) {
-        console.error('Failed to load more klines:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    loadMoreKlines();
-  }, [coin, expandedCandleCount]);
-
-  const chartData = useMemo(() => {
-    if (!expandedKlines?.length) return [];
-    return expandedKlines.slice(-expandedCandleCount).map(k => ({
-      time:   Math.floor(parseInt(k[0]) / 1000),
-      open:   parseFloat(k[1]), high:  parseFloat(k[2]),
-      low:    parseFloat(k[3]), close: parseFloat(k[4]),
-      volume: parseFloat(k[7] || 0),
-    })).filter(d => d.time && d.open && d.high && d.low && d.close);
-  }, [expandedKlines, expandedCandleCount]);
-
-  const volumeData = useMemo(() =>
-    chartData.map(d => ({ time: d.time, value: d.volume, color: d.close >= d.open ? '#26a69a' : '#ef5350' })),
-    [chartData]
-  );
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-    
-    const initChart = () => {
-      try {
-        while (containerRef.current.firstChild) containerRef.current.removeChild(containerRef.current.firstChild);
-        
-        const chart = createChart(containerRef.current, {
-          width:  containerRef.current.clientWidth,
-          height: EXPANDED_CHART_HEIGHT,
-          layout: { background: { type: ColorType.Solid, color: '#0c0d0e' }, textColor: '#6b7280', fontSize: 10, fontFamily: 'Monaco, monospace' },
-          grid: { vertLines: { color: '#1f2937', style: LineStyle.Dashed }, horzLines: { color: '#1f2937', style: LineStyle.Dashed } },
-          crosshair: {
-            mode: CrosshairMode.Normal,
-            vertLine: { color: '#fbbf24', width: 1, style: LineStyle.Solid, labelBackgroundColor: '#fbbf24' },
-            horzLine: { color: '#fbbf24', width: 1, style: LineStyle.Solid, labelBackgroundColor: '#fbbf24' },
-          },
-          rightPriceScale: { borderColor: '#2a2e39', textColor: '#9ca3af', fontSize: 10, scaleMargins: { top: 0.1, bottom: 0.25 } },
-          handleScroll: { mouseWheel: true, pressedMouseMove: true },
-          handleScale:  { mouseWheel: true, pinch: true },
-          timeScale: {
-            borderColor: '#2a2e39', timeVisible: true, secondsVisible: false,
-            tickMarkFormatter: (t) => { const d = new Date(t*1000); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; },
-            fixLeftEdge: true, fixRightEdge: false, rightOffset: 3,
-          },
-        });
-
-        const precision = coin?.lastPrice < 1 ? 4 : 2;
-        const minMove   = coin?.lastPrice < 1 ? 0.0001 : 0.01;
-
-        candleRef.current = chart.addSeries(CandlestickSeries, {
-          upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
-          wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-          priceFormat: { type: 'price', precision, minMove },
-        });
-
-        volumeRef.current = chart.addSeries(HistogramSeries, {
-          color: '#26a69a', priceFormat: { type: 'volume' }, priceScaleId: 'volume',
-          scaleMargins: { top: 0.8, bottom: 0 },
-        });
-        chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 }, visible: true, borderVisible: false, textColor: '#6b7280', fontSize: 10 });
-
-        chartRef.current = chart;
-        setContainerWidth(containerRef.current.clientWidth);
-        setReady(true);
-      } catch (e) {
-        console.error('Expanded chart init error:', e);
-      }
-    };
-
-    initChart();
-    
-    return () => {
-      try { chartRef.current?.remove(); } catch {}
-      chartRef.current = null; candleRef.current = null; volumeRef.current = null;
-      setReady(false);
-    };
-  }, [coin?.symbol]);
-
-  useEffect(() => {
-    if (!candleRef.current || !volumeRef.current || !chartData.length || !ready) return;
-    try {
-      candleRef.current.setData(chartData);
-      volumeRef.current.setData(volumeData);
-      chartRef.current?.timeScale().fitContent();
-    } catch (e) { console.error('Expanded chart data error:', e); }
-  }, [chartData, volumeData, ready]);
-
-  useEffect(() => {
-    if (!chartRef.current || !candleRef.current || !ready) return;
-    try {
-      linesRef.current.forEach(l => { try { candleRef.current?.removePriceLine(l); } catch {} });
-      linesRef.current = [];
-      const add = (price, color, style, width = 1, label = '') => {
-        if (!price || price <= 0) return;
-        linesRef.current.push(candleRef.current.createPriceLine({ price, color, lineWidth: width, lineStyle: style, axisLabelVisible: !!label, title: label }));
-      };
-      add(coin?.levels?.h1?.h, 'rgba(255,255,255,0.35)', LineStyle.Solid, 1);
-      add(coin?.levels?.h1?.l, 'rgba(255,255,255,0.35)', LineStyle.Solid, 1);
-      add(coin?.levels?.h4?.h, '#f59e0b', LineStyle.Dotted, 1);
-      add(coin?.levels?.h4?.l, '#3b82f6', LineStyle.Dotted, 1);
-      add(coin?.levels?.d24?.h, '#ef4444', LineStyle.Dashed, 1);
-      add(coin?.levels?.d24?.l, '#22c55e', LineStyle.Dashed, 1);
-    } catch {}
-  }, [ready, coin?.levels]);
-
-  const handleKeyDown = useCallback((e) => {
-    if (e.key === 'Escape') onClose();
-  }, [onClose]);
-
-  useEffect(() => {
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [handleKeyDown]);
-
-  const fmt = (v) => (v !== undefined && !isNaN(v)) ? (v * 100).toFixed(2) + '%' : '0.00%';
-  const chColor = coin?.change24h >= 0 ? 'text-emerald-500' : 'text-rose-500';
-  const ch30Color = (coin?.change30m || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400';
-
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-sm" onClick={onClose}>
-      <div 
-        ref={modalRef}
-        className="relative bg-[#131722] rounded-lg w-[95vw] h-[90vh] flex flex-col overflow-hidden border border-yellow-500/30 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="absolute top-0 left-0 right-0 z-20 bg-gradient-to-b from-black/95 via-black/40 to-transparent pointer-events-none p-3">
-          <div className="flex justify-between items-start">
-            <div className="flex flex-col gap-1 pointer-events-auto">
-              <div className="flex items-center gap-2">
-                <span className="text-lg text-white font-bold tracking-tight uppercase">
-                  {coin?.symbol?.replace('USDT', '') || '???'}
-                </span>
-                <span className={`${chColor} font-semibold text-xs`}>
-                  {coin?.change24h > 0 ? '+' : ''}{coin?.change24h?.toFixed(2)}%
-                </span>
-                <span className={`${ch30Color} font-bold text-xs`}>
-                  1H: {(coin?.change30m || 0) > 0 ? '+' : ''}{(coin?.change30m || 0).toFixed(2)}%
-                </span>
-              </div>
-              <div className="flex gap-4 text-xs">
-                <span style={{color: volColor(coin?.quoteVolume||0)}}>V: ${coin?.quoteVolume?.toFixed(1)}M</span>
-                <span style={{color: ntrColor(coin?.ntr||0)}}>NTR: {coin?.ntr?.toFixed(2)}%</span>
-                <span style={{color: t15Color(coin?.trades15min||0)}}>T15: {coin?.trades15min?.toLocaleString()}</span>
-                <span className="text-slate-400">Свечей: {chartData.length}</span>
-              </div>
-            </div>
-            <button onClick={onClose} className="pointer-events-auto bg-black/50 hover:bg-black/70 p-1 rounded-full transition-colors">
-              <X size={20} className="text-white" />
-            </button>
-          </div>
-        </div>
-
-        <div ref={wrapperRef} className="relative w-full flex-grow mt-16">
-          <div ref={containerRef} className="w-full h-full" />
-          <RulerOverlay ruler={ruler} containerWidth={containerWidth} />
-          <MiniOrderBars orders={ordersMap[coin?.symbol] || []} candleRef={candleRef} chartHeight={EXPANDED_CHART_HEIGHT} fullscreen={true} soundEnabled={false} />
-        </div>
-
-        <div className="absolute bottom-2 left-3 z-10 pointer-events-none">
-          <div className="flex gap-2 text-xs">
-            <span className="px-1 font-mono font-semibold text-red-400 bg-red-400/10 rounded">1H L:{fmt(coin?.dist_h1l)}</span>
-            <span className="px-1 font-mono font-semibold text-red-400 bg-red-400/10 rounded">4H L:{fmt(coin?.dist_h4l)}</span>
-            <span className="px-1 font-mono font-semibold text-red-400 bg-red-400/10 rounded">24H L:{fmt(coin?.dist_d24l)}</span>
-          </div>
-        </div>
-        <div className="absolute bottom-2 right-3 z-10 pointer-events-none">
-          <div className="flex gap-2 text-xs">
-            <span className="px-1 font-mono font-semibold text-emerald-500 bg-emerald-500/10 rounded">1H H:{fmt(coin?.dist_h1h)}</span>
-            <span className="px-1 font-mono font-semibold text-emerald-500 bg-emerald-500/10 rounded">4H H:{fmt(coin?.dist_h4h)}</span>
-            <span className="px-1 font-mono font-semibold text-emerald-500 bg-emerald-500/10 rounded">24H H:{fmt(coin?.dist_d24h)}</span>
-          </div>
-        </div>
-
-        {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-30">
-            <div className="w-6 h-6 border border-yellow-500/30 border-t-yellow-500 rounded-full animate-spin" />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
 const TradingViewChart = React.memo(({
-  klines, coin, copiedSymbol, onCopy, trades15min, candleCount,
-  orders, soundEnabled, onExpand
+  klines, coin, copiedSymbol, onCopy, trades15min, candleCount
 }) => {
   const containerRef   = useRef(null);
   const wrapperRef     = useRef(null);
@@ -1094,17 +715,11 @@ const TradingViewChart = React.memo(({
   const chColor = coin?.change24h >= 0 ? 'text-emerald-500' : 'text-rose-500';
   const ch30Color = (coin?.change30m || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400';
 
-  const handleContextMenu = useCallback((e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (onExpand) onExpand();
-  }, [onExpand]);
-
   if (error) return <div className="w-full h-full bg-[#0c0d0e] flex items-center justify-center text-red-500 text-[10px]">⚠️ Ошибка графика</div>;
   if (!klines?.length) return <div className="w-full h-full bg-[#0c0d0e] flex items-center justify-center text-slate-700 text-[10px]">Нет данных</div>;
 
   return (
-    <div className="flex-grow flex flex-col w-full relative overflow-hidden rounded bg-[#0c0d0e]" onContextMenu={handleContextMenu}>
+    <div className="flex-grow flex flex-col w-full relative overflow-hidden rounded bg-[#0c0d0e]">
       <div className="absolute top-0 left-0 right-0 z-20 bg-gradient-to-b from-black/95 via-black/40 to-transparent pointer-events-none p-1.5">
         <div className="flex justify-between items-start">
           <div className="flex flex-col gap-0.5">
@@ -1139,7 +754,7 @@ const TradingViewChart = React.memo(({
               <span className="text-[5px] text-purple-300 font-bold">{chartData.length} св</span>
             </div>
             <div className="flex items-center gap-0.5 mt-0.5 opacity-40">
-              <span className="text-[4px] text-slate-500">📏 ПКМ колёсико | ПКМ график для увеличения</span>
+              <span className="text-[4px] text-slate-500">📏 ПКМ колёсико</span>
             </div>
           </div>
         </div>
@@ -1148,7 +763,6 @@ const TradingViewChart = React.memo(({
       <div ref={wrapperRef} className="relative w-full" style={{ height: CHART_HEIGHT }}>
         <div ref={containerRef} className="w-full h-full" />
         <RulerOverlay ruler={ruler} containerWidth={containerWidth} />
-        <MiniOrderBars orders={orders} candleRef={candleRef} soundEnabled={soundEnabled} />
         {ruler?.isDragging && (
           <div className="absolute inset-0 pointer-events-none z-50" style={{ cursor: 'ns-resize' }} />
         )}
@@ -1206,7 +820,6 @@ const App = () => {
   const [searchInput, setSearchInput] = useState('');
   const [searchTerm,  setSearchTerm]  = useState('');
   const [copiedSymbol,setCopiedSymbol]= useState(null);
-  const [expandedCoin, setExpandedCoin] = useState(null);
 
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -1242,8 +855,7 @@ const App = () => {
   const { sortedData, totalPages, filteredCount } = useMemo(() => {
     const itemsPerPage = (gridMode === '16grid' ? 16 : 12) - 1;
     const filtered = data.filter(item => {
-      if (!item) return false;
-      if (item.symbol === 'BTCUSDT') return true;
+      if (!item || item.symbol === 'BTCUSDT') return false;
       const c1h = item.change1h || 0;
       let c1hOk = true;
       if (change1hDir === 'up')   c1hOk = c1h >= minChange1h;
@@ -1257,8 +869,6 @@ const App = () => {
       );
     });
     const sorted = [...filtered].sort((a, b) => {
-      if (a.symbol === 'BTCUSDT') return 1;
-      if (b.symbol === 'BTCUSDT') return -1;
       const va = a?.[sortBy] || 0, vb = b?.[sortBy] || 0;
       return sortOrder === 'asc' ? va - vb : vb - va;
     });
@@ -1278,8 +888,10 @@ const App = () => {
 
   const displayData = useMemo(() => {
     const totalSlots  = gridMode === '16grid' ? 16 : 12;
+    const btc = data.find(d => d?.symbol === 'BTCUSDT') || null;
     const grid = new Array(totalSlots).fill(null);
     pageData.forEach((c, i) => { grid[i] = c; });
+    grid[totalSlots - 1] = btc;
     if (isHovered && frozenRef.current) {
       return frozenRef.current.map(fc => fc ? (data.find(d => d.symbol === fc.symbol) || fc) : null);
     }
@@ -1292,12 +904,6 @@ const App = () => {
     const visible = displayData.filter(Boolean).map(c => c.symbol);
     updateVisible(visible);
   }, [displayData, updateVisible]);
-
-  const orderSymbols = useMemo(
-    () => displayData.filter(Boolean).map(c => c.symbol).filter(s => s !== 'BTCUSDT'),
-    [displayData]
-  );
-  const ordersMap = useLargeOrders(orderSymbols);
 
   const totalPagesVal = totalPages;
   const goPage = useCallback((p) => setPageIndex(Math.max(0, Math.min(p, totalPagesVal - 1))), [totalPagesVal]);
@@ -1330,10 +936,6 @@ const App = () => {
     if (sortBy === field) setSortOrder(o => o === 'asc' ? 'desc' : 'asc');
     else { setSortBy(field); setSortOrder(field.startsWith('dist_') ? 'asc' : 'desc'); }
   };
-
-  const handleExpandChart = useCallback((coinData) => {
-    if (coinData) setExpandedCoin(coinData);
-  }, []);
 
   useEffect(() => {
     const onMouseDown = (e) => { if (e.button === 1) e.preventDefault(); };
@@ -1485,14 +1087,14 @@ const App = () => {
         style={{ opacity: gridVisible ? 1 : 0, transition: 'opacity 0.25s ease' }}
       >
         {displayData.map((coin, idx) => {
-          const isBtc = coin?.symbol === 'BTCUSDT';
+          const isBtc = idx === totalSlots - 1;
           return (
             <div
               key={coin ? `${coin.symbol}-${idx}` : `empty-${idx}`}
               onClick={() => coin && onCopy(coin.symbol)}
-              className={`bg-[#131722] rounded-sm flex flex-col relative overflow-hidden cursor-pointer border border-[#2a2e39] ${isBtc ? 'shadow-[inset_0_0_10px_rgba(234,179,8,0.1)] border-yellow-500/50' : ''}`}
+              className={`bg-[#131722] rounded-sm flex flex-col relative overflow-hidden cursor-pointer border border-[#2a2e39] ${isBtc ? 'shadow-[inset_0_0_10px_rgba(234,179,8,0.1)]' : ''}`}
               style={{
-                transition: `border-color 0.4s ease, box-shadow 0.4s ease, opacity 0.3s ease ${idx * 18}ms, transform 0.3s ease ${idx * 18}ms`,
+                transition: `opacity 0.3s ease ${idx * 18}ms, transform 0.3s ease ${idx * 18}ms`,
                 opacity:   gridVisible ? 1 : 0,
                 transform: gridVisible ? 'scale(1)' : 'scale(0.97)',
               }}
@@ -1509,9 +1111,6 @@ const App = () => {
                     onCopy={onCopy}
                     trades15min={coin.trades15min}
                     candleCount={candleCount}
-                    orders={ordersMap[coin.symbol] || []}
-                    soundEnabled={false}
-                    onExpand={() => handleExpandChart(coin)}
                   />
                 </ChartErrorBoundary>
               ) : (
@@ -1522,16 +1121,6 @@ const App = () => {
         })}
       </div>
       </TickContext.Provider>
-
-      {expandedCoin && (
-        <ExpandedChartModal
-          coin={expandedCoin}
-          klines={expandedCoin.klines}
-          onClose={() => setExpandedCoin(null)}
-          candleCount={candleCount}
-          ordersMap={ordersMap}
-        />
-      )}
 
     </div>
   );
