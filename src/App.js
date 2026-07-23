@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { createChart, ColorType, CrosshairMode, LineStyle, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
+import { createChart, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
 import {
   RefreshCw, Search, Copy, Check, TrendingUp, ChevronLeft, ChevronRight,
   Clock, ChevronUp, ChevronDown, Grid3x3, Grid2x2, BarChart3
@@ -609,13 +609,13 @@ const TradingViewChart = React.memo(({
         const precision = coin?.lastPrice < 1 ? 4 : 2;
         const minMove   = coin?.lastPrice < 1 ? 0.0001 : 0.01;
 
-        candleRef.current = chart.addSeries(CandlestickSeries, {
+        candleRef.current = chart.addCandlestickSeries({
           upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
           wickUpColor: '#26a69a', wickDownColor: '#ef5350',
           priceFormat: { type: 'price', precision, minMove },
         });
 
-        volumeRef.current = chart.addSeries(HistogramSeries, {
+        volumeRef.current = chart.addHistogramSeries({
           color: '#26a69a', priceFormat: { type: 'volume' }, priceScaleId: 'volume',
           scaleMargins: { top: 0.8, bottom: 0 },
         });
