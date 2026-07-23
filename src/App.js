@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { createChart, ColorType, CrosshairMode, LineStyle } from 'lightweight-charts';
 import {
   RefreshCw, Search, Copy, Check, TrendingUp, ChevronLeft, ChevronRight,
-  Clock, ChevronUp, ChevronDown, Grid3x3, Grid2x2, BarChart3
+  Clock, ChevronUp, ChevronDown, Grid3x3, LayoutGrid, BarChart3
 } from 'lucide-react';
 
 const MAX_CANDLE_COUNT = 500;
@@ -1043,7 +1043,7 @@ const App = () => {
               </div>
               <button onClick={() => setGridMode(m => m === '16grid' ? '12grid' : '16grid')}
                 className={`px-1.5 py-0.5 rounded text-[7px] font-semibold uppercase flex items-center gap-0.5 ${gridMode === '16grid' ? 'bg-yellow-500 text-black' : 'bg-slate-700 text-white'}`}>
-                {gridMode === '16grid' ? <Grid2x2 size={7} /> : <Grid3x3 size={7} />}
+                {gridMode === '16grid' ? <LayoutGrid size={7} /> : <Grid3x3 size={7} />}
                 {gridMode === '16grid' ? '16' : '12'}
               </button>
               <div className="flex items-center gap-1 border-l border-white/5 pl-3">
